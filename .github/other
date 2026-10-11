@@ -1,0 +1,229 @@
+Here is the updated code incorporating a dedicated RS485SerialWorker thread. It uses standard pyserial and a thread-safe queue.Queue to non-blockingly dispatch Modbus RTU frames directly to hardware UART, while automatically managing hardware RTS line toggles (Direction Control) if required by your transceiver.
+import queue
+import struct
+import threading
+import time
+from typing import Dict, Any, Optional
+
+import serial  # Requires: pip install pyserial
+
+
+class RS485RelayDriver:
+    """Generates Modbus RTU frames for RS-485 relay coils."""
+    
+    @staticmethod
+    def calculate_crc16(data: bytes) -> bytes:
+        crc = 0xFFFF
+        for pos in data:
+            crc ^= pos
+            for _ in range(8):
+                if (crc & 0x0001) != 0:
+                    crc >>= 1
+                    crc ^= 0xA001
+                else:
+                    crc >>= 1
+        return struct.pack("<H", crc)
+
+    @classmethod
+    def build_write_single_coil(cls, slave_addr: int, coil_addr: int, turn_on: bool) -> bytes:
+        value = 0xFF00 if turn_on else 0x0000
+        payload = struct.pack(">BBHH", slave_addr, 0x05, coil_addr, value)
+        return payload + cls.calculate_crc16(payload)
+
+
+class RS485SerialWorker(threading.Thread):
+    """
+    Background worker thread handling hardware UART communication via PySerial.
+    Pulls binary Modbus frames from a thread-safe queue and writes to the bus.
+    """
+    def __init__(self, port: str = "/dev/ttyUSB0", baudrate: int = 9600, timeout: float = 1.0):
+        super().__init__(daemon=True)
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.cmd_queue: queue.Queue = queue.Queue()
+        self.running = True
+        self.ser: Optional[serial.Serial] = None
+
+    def run(self):
+        # Open hardware serial connection
+        try:
+            self.ser = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=self.timeout
+            )
+            # Enable hardware RS-485 RTS Direction Control if supported by system/chipset
+            try:
+                self.ser.rs485_mode = serial.rs485.RS485Settings(
+                    rts_level_for_tx=True,
+                    rts_level_for_rx=False,
+                    delay_before_tx=0.005,
+                    delay_before_rx=0.005
+                )
+            except AttributeError:
+                pass  # Standard FTDI/UART without driver-level RS-485 settings
+
+            print(f"[RS485 Worker] Hardware port {self.port} initialized at {self.baudrate} baud.")
+        except serial.SerialException as e:
+            print(f"[RS485 Worker Error] Could not open port {self.port}: {e}")
+            print("[RS485 Worker] Running in DRY-RUN mode (logging commands only).")
+
+        while self.running:
+            try:
+                # Non-blocking fetch with 0.5s timeout to allow clean thread shutdown
+                frame_bytes = self.cmd_queue.get(timeout=0.5)
+                
+                if self.ser and self.ser.is_open:
+                    self.ser.reset_input_buffer()
+                    self.ser.write(frame_bytes)
+                    self.ser.flush()
+                    
+                    # Optional: Read response frame (8 bytes expected for Write Single Coil echo)
+                    response = self.ser.read(8)
+                    print(f"[RS485 TX -> HW] Sent: {frame_bytes.hex().upper()} | RX Echo: {response.hex().upper()}")
+                else:
+                    print(f"[RS485 TX -> DRY RUN] {frame_bytes.hex().upper()}")
+
+                self.cmd_queue.task_done()
+            except queue.Empty:
+                continue
+
+    def send_frame(self, frame_bytes: bytes):
+        """Thread-safe method to queue an RS-485 payload for transmission."""
+        self.cmd_queue.put(frame_bytes)
+
+    def stop(self):
+        self.running = False
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+
+
+class MultiPollutantTriggerEngine:
+    def __init__(self,
+                 pollutant_weights: Dict[str, float],
+                 composite_threshold: float = 100.0,
+                 sustained_duration_sec: int = 15,
+                 cooldown_sec: int = 300,
+                 alpha: float = 0.3,
+                 rs485_slave_id: int = 1,
+                 rs485_coil_index: int = 0,
+                 serial_worker: Optional[RS485SerialWorker] = None):
+        
+        self.weights = pollutant_weights
+        self.composite_threshold = composite_threshold
+        self.sustained_duration_sec = sustained_duration_sec
+        self.cooldown_sec = cooldown_sec
+        self.alpha = alpha
+        
+        self.slave_id = rs485_slave_id
+        self.coil_index = rs485_coil_index
+        self.serial_worker = serial_worker
+
+        self.smoothed_readings: Dict[str, float] = {}
+        self.exceedance_start_time: Optional[float] = None
+        self.last_trigger_time: float = 0.0
+        self.is_trigger_active: bool = False
+
+    def process_readings(self, raw_readings: Dict[str, float], current_timestamp: Optional[float] = None) -> Dict[str, Any]:
+        now = current_timestamp if current_timestamp else time.time()
+        
+        # 1. EMA Smoothing & Composite Calculation
+        composite_score = 0.0
+        for channel, raw_val in raw_readings.items():
+            if channel not in self.smoothed_readings:
+                self.smoothed_readings[channel] = raw_val
+            else:
+                self.smoothed_readings[channel] = (self.alpha * raw_val) + ((1.0 - self.alpha) * self.smoothed_readings[channel])
+            
+            weight = self.weights.get(channel, 1.0)
+            composite_score += self.smoothed_readings[channel] * weight
+
+        # 2. Cooldown check
+        time_since_last_trigger = now - self.last_trigger_time
+        in_cooldown = time_since_last_trigger < self.cooldown_sec
+
+        # 3. Threshold Evaluation
+        rs485_command_hex = None
+        if composite_score >= self.composite_threshold:
+            if self.exceedance_start_time is None:
+                self.exceedance_start_time = now
+            
+            elapsed_exceedance = now - self.exceedance_start_time
+            
+            if elapsed_exceedance >= self.sustained_duration_sec and not in_cooldown and not self.is_trigger_active:
+                self.is_trigger_active = True
+                self.last_trigger_time = now
+                status_action = "TRIGGER_CANISTER_OPEN"
+                
+                # Build and dispatch OPEN frame
+                frame_bytes = RS485RelayDriver.build_write_single_coil(self.slave_id, self.coil_index, turn_on=True)
+                rs485_command_hex = frame_bytes.hex().upper()
+                if self.serial_worker:
+                    self.serial_worker.send_frame(frame_bytes)
+
+            elif self.is_trigger_active:
+                status_action = "SAMPLING_IN_PROGRESS"
+            elif in_cooldown:
+                status_action = "THRESHOLD_EXCEEDED_BUT_COOLDOWN_ACTIVE"
+            else:
+                status_action = "EVALUATING_SUSTAINED_SPIKE"
+        else:
+            if self.is_trigger_active:
+                status_action = "SAMPLING_COMPLETE_CLOSING_VALVE"
+                # Build and dispatch CLOSE frame
+                frame_bytes = RS485RelayDriver.build_write_single_coil(self.slave_id, self.coil_index, turn_on=False)
+                rs485_command_hex = frame_bytes.hex().upper()
+                if self.serial_worker:
+                    self.serial_worker.send_frame(frame_bytes)
+            else:
+                status_action = "NORMAL_MONITORING"
+
+            self.exceedance_start_time = None
+            self.is_trigger_active = False
+
+        return {
+            "timestamp": now,
+            "composite_score": round(composite_score, 2),
+            "action": status_action,
+            "rs485_payload_hex": rs485_command_hex
+        }
+
+
+# Quick Execution Test
+if __name__ == "__main__":
+    # Start background UART worker (will fall back to dry-run mode if /dev/ttyUSB0 isn't attached)
+    uart_worker = RS485SerialWorker(port="/dev/ttyUSB0", baudrate=9600)
+    uart_worker.start()
+
+    engine = MultiPollutantTriggerEngine(
+        pollutant_weights={"pm25": 2.0, "voc": 0.5},
+        composite_threshold=100.0,
+        sustained_duration_sec=2,
+        cooldown_sec=10,
+        alpha=0.5,
+        serial_worker=uart_worker
+    )
+
+    data_stream = [
+        {"pm25": 10.0, "voc": 20.0},
+        {"pm25": 55.0, "voc": 120.0}, # Spike start
+        {"pm25": 55.0, "voc": 120.0}, # Duration met -> TRIGGER DISPATCH
+        {"pm25": 10.0, "voc": 20.0},  # Normal -> CLOSE DISPATCH
+    ]
+
+    for i, reading in enumerate(data_stream):
+        t = 1000 + (i * 2)
+        res = engine.process_readings(reading, current_timestamp=t)
+        print(f"Time: {res['timestamp']} | Score: {res['composite_score']} | Action: {res['action']}")
+        time.sleep(0.5)
+
+    uart_worker.stop()
+
+Architecture Details
+ * Thread Isolation: Serial I/O blocking (write() / read() timeouts) runs entirely inside RS485SerialWorker, ensuring primary sensor ingestion loops never drop packets.
+ * Hardware RTS Management: Automatically configures pyserial.rs485.RS485Settings to toggle direction control pins (DE/RE) on RS-485 transceiver boards.
+ * Fault Tolerance: Gracefully degrades to a dry-run logging mode if the designated hardware serial port (/dev/ttyUSB0 or COM3) is absent or busy.
